@@ -12,7 +12,7 @@ bash install.sh
 ## Data Processing
 Tokenize the data and store them in binary files:
 ```bash
-bash scripts/qwen/tools/process_data_dolly.sh 
+bash scripts/qwen/process_data_dolly.sh 
 ```
 
 ## Train CSD
