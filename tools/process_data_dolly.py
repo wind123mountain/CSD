@@ -21,36 +21,9 @@ class Encoder(object):
 
     def encode(self, line):
         line = json.loads(line)
-        if "input" not in line or len(line["input"]) == 0:
-            if self.args.model_type!="qwen":
-                template = (
-                    "Below is an instruction that describes a task. "
-                    "Write a response that appropriately completes the request.\n\n"
-                    "### Instruction:\n{instruction}\n\n### Response:\n"
-                )
-            else:
-                template = (
-                    "<|im_start|>Below is an instruction that describes a task. "
-                    "Write a response that appropriately completes the request.\n\n"
-                    "### Instruction:\n{instruction}\n\n### Response:\n<|im_end|><|im_start|>Assistant:"
-                )
-            prompt = template.format(instruction=line["instruction"])
-        else:
-            if self.args.model_type!="qwen":
-                template = (
-                    "Below is an instruction that describes a task, paired with an input that provides further context. "
-                    "Write a response that appropriately completes the request.\n\n"
-                    "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
-                )
-            else:
-                template = (
-                    "<|im_start|>Below is an instruction that describes a task, paired with an input that provides further context. "
-                    "Write a response that appropriately completes the request.\n\n"
-                    "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n<|im_end|><|im_start|>Assistant:"
-                )
-            prompt = template.format(instruction=line["instruction"], input=line["input"])
-            
         response = line["output"]
+        prompt = line["prompt"]
+
         prompt_tokens = Encoder.tokenizer.encode(prompt, add_special_tokens=False)
         full_tokens = Encoder.tokenizer.encode(prompt + response, add_special_tokens=False) + [Encoder.tokenizer.eos_token_id]
         response_tokens = full_tokens[len(prompt_tokens):]
@@ -71,17 +44,15 @@ def main():
 
     os.makedirs(args.processed_data_dir, exist_ok=True)
     
-    with open(os.path.join(args.data_dir, "raw.jsonl")) as f:
-        raw_data = f.readlines()
+    with open(os.path.join(args.data_dir, "train.jsonl")) as f:
+        train_data = f.readlines()
+    with open(os.path.join(args.data_dir, "dev.jsonl")) as f:
+        valid_data = f.readlines()
 
     if args.dev_num > 0:
         all_data = {
-            "valid": raw_data[:args.dev_num],
-            "train": raw_data[args.dev_num:]
-        }
-    else:
-        all_data = {
-            "train": raw_data
+            "valid": valid_data,
+            "train": train_data
         }
     
     for split in all_data:
@@ -98,7 +69,7 @@ def main():
         bin_file = os.path.join(args.processed_data_dir, f"{split}_{0}.bin")
         idx_file = os.path.join(args.processed_data_dir, f"{split}_{0}.idx")
 
-        if args.model_type!="qwen":
+        if args.model_type!="qwen" and args.model_type!="qwen3":
             binary_builder = make_builder(bin_file, impl="mmap", dtype=np.uint16)
         else:
             binary_builder = make_builder(bin_file, impl="mmap", dtype=np.uint32)
@@ -129,7 +100,7 @@ def main():
                 "instruction": line["instruction"],
                 "prompt": prompt_str,
                 "input": line["input"],
-                "output": line["output"],
+                "response": line["output"],
             }) + "\n")
 
             prompt_lens.append(len(prompt))

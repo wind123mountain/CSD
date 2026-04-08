@@ -20,17 +20,17 @@ BASE_PATH=.
 CKPT_NAME="qwen3-0.6B"
 CKPT="Qwen/Qwen3-0.6B"
 TEACHER_CKPT_NAME="qwen3-4B"
-TEACHER_CKPT="Qwen/Qwen3-4B-Instruct-2507"
+TEACHER_CKPT="Qwen/Qwen3-0.6B"
 # data
-DATA_DIR="${BASE_PATH}/processed_data/ace/qwen/"
+DATA_DIR="${BASE_PATH}/processed_data/dolly/qwen/"
 # hp
-BATCH_SIZE=2
+BATCH_SIZE=1
 LR=0.0001
 GRAD_ACC=8
 EVAL_BATCH_SIZE=32
 EPOCHS=5
 # length
-MAX_LENGTH=768
+MAX_LENGTH=256
 # runtime
 SAVE_PATH="${BASE_PATH}/results/qwen3/distillm_0.6B_4B_ace_csd"
 # seed
@@ -45,7 +45,7 @@ OPTS+=" --teacher-model-path ${TEACHER_CKPT}"
 OPTS+=" --ckpt-name ${CKPT_NAME}"
 OPTS+=" --teacher-ckpt-name ${TEACHER_CKPT_NAME}"
 OPTS+=" --teacher-model-fp16"
-OPTS+=" --teacher-peft-path results/qwen3/sft_4B_ace/e5-bs2-lr0.0001-G8-N2-NN1-lora-32-64-0.05/490"
+# OPTS+=" --teacher-peft-path results/qwen3/sft_4B_ace/e5-bs2-lr0.0001-G8-N2-NN1-lora-32-64-0.05/490"
 OPTS+=" --model-type qwen"
 OPTS+=" --n-gpu ${GPUS_PER_NODE}"
 # data
@@ -65,7 +65,7 @@ OPTS+=" --epochs ${EPOCHS}"
 OPTS+=" --kd-ratio 1.0"
 # length
 OPTS+=" --max-length ${MAX_LENGTH}"
-OPTS+=" --max-prompt-length 460"
+OPTS+=" --max-prompt-length 128"
 # runtime
 OPTS+=" --do-train"
 OPTS+=" --do-valid"
