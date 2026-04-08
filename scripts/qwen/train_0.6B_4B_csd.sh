@@ -20,7 +20,7 @@ BASE_PATH=.
 CKPT_NAME="qwen3-0.6B"
 CKPT="Qwen/Qwen3-0.6B"
 TEACHER_CKPT_NAME="qwen3-4B"
-TEACHER_CKPT="Qwen/Qwen3-0.6B"
+TEACHER_CKPT="Qwen/Qwen3-4B-Instruct-2507"
 # data
 DATA_DIR="${BASE_PATH}/processed_data/dolly/qwen/"
 # hp
