@@ -212,11 +212,13 @@ def get_optimizer_params_peft(args, model: nn.Module):
 def get_tokenizer(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, padding_side="right")
 
-    if args.model_type == "qwen":
-        tokenizer.eos_token_id = 151645 
+    # if args.model_type == "qwen":
+    #     tokenizer.eos_token_id = 151645 
     tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.pad_token = tokenizer.eos_token
-    # print(tokenizer.eos_token_id)
+    if tokenizer.bos_token_id is None:
+        tokenizer.bos_token_id = tokenizer.pad_token_id
+
 
     
     return tokenizer
