@@ -21,13 +21,13 @@ BASE_PATH="/media/volume/tucnv/LLM_Distillation/CSD"
 CKPT_NAME="qwen2.5-0.5b"
 CKPT="Qwen/Qwen2.5-0.5B"
 TEACHER_CKPT_NAME="qwen2.5-1.5b-math"
-TEACHER_CKPT="Qwen/Qwen2.5-Math-1.5B"
+TEACHER_CKPT="Qwen/Qwen2.5-Math-1.5B-Instruct"
 # data
 DATA_DIR="${BASE_PATH}/processed_data/MetaMathQA-50k/qwen/"
 # hp
-BATCH_SIZE=8
+BATCH_SIZE=4
 LR=0.0001
-GRAD_ACC=2
+GRAD_ACC=4
 EVAL_BATCH_SIZE=64
 EPOCHS=1
 # length

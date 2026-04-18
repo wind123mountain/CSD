@@ -70,7 +70,7 @@ NNM_CFG = dict(
     high_ent_rho      = None,        # keep top 20% entropy tokens for KL
     high_ent_weight_ratio=2.0, #20% 
     # -- Top-K logit KD --
-    top_k_logits      = 30,
+    top_k_logits      = None,
  
     # -- Difficulty-aware weighting --
     use_difficulty_weight  = False,
@@ -143,6 +143,7 @@ class RunningCentroids:
         eta = self.eta / (1 + 0.001 * self._step)
         dists  = torch.cdist(H, self.C)
         assign = dists.argmin(dim=1)
+        new_C = self.C.clone()
         for k in range(self.K):
             mask = (assign == k)
             if mask.any():
@@ -153,6 +154,7 @@ class RunningCentroids:
                 if self.dead[k] >= self.T_dead:
                     self.C[k] = H[random.randint(0, len(H) - 1)].clone()
                     self.dead[k] = 0
+        self.C = new_C
  
  
 # # ============================================================================
@@ -193,17 +195,33 @@ def select_mid_layers(n_layers, n_mid):
     return sorted(set(int(i) for i in np.linspace(lo, hi, n_mid, dtype=int).tolist()))
  
  
-def nnm_loss_one_layer(H_s, H_t, projector, C_s, C_t, lw, ns_iters):
-    R_t = make_R(H_t.size(-1), NNM_CFG["d_prime"], H_t.device, H_t.dtype).detach()
+# def nnm_loss_one_layer(H_s, H_t, projector, C_s, C_t, lw, ns_iters):
+#     R_t = make_R(H_t.size(-1), NNM_CFG["d_prime"], H_t.device, H_t.dtype).detach()
 
-    M_s = projector(torch.cat([C_s.detach(), H_s], dim=0)) @ R_t
-    M_t = torch.cat([C_t.detach(), H_t], dim=0) @ R_t
+#     M_s = projector(torch.cat([C_s.detach(), H_s], dim=0)) @ R_t
+#     M_t = torch.cat([C_t.detach(), H_t], dim=0) @ R_t
+#     scale = math.sqrt(M_t.size(0) * M_t.size(1))
+#     nn_s = nuclear_norm_ns(M_s, ns_iters) / scale
+#     nn_t = (nuclear_norm_ns(M_t, ns_iters) / scale).detach()
+
+#     return lw * (nn_s - nn_t) ** 2
+ 
+def nnm_loss_one_layer(H_s, H_t, projector, C_s, C_t, R, lw, ns_iters):
+    # Project student lên teacher space
+    H_s_proj = projector(H_s)                    # gradient chạy qua đây
+    C_s_proj = projector(C_s.detach().clone())   # không gradient qua C_s
+
+    H_t = H_t.detach()                           # tường minh
+    C_t = C_t.detach().clone()
+
+    M_s = torch.cat([C_s_proj, H_s_proj], dim=0) @ R
+    M_t = torch.cat([C_t, H_t], dim=0) @ R
+
     scale = math.sqrt(M_t.size(0) * M_t.size(1))
     nn_s = nuclear_norm_ns(M_s, ns_iters) / scale
     nn_t = (nuclear_norm_ns(M_t, ns_iters) / scale).detach()
 
     return lw * (nn_s - nn_t) ** 2
- 
  
 @torch.no_grad()
 def correct_teacher_hiddens(H_T, C_T, R, lam, ns_iters, tc_steps=1):
@@ -281,7 +299,7 @@ def compute_difficulty_weights(model, input_ids, attention_mask, early_layer_idx
 def apply_token_filters(s_logits_active, t_logits_active,
                         s2t_tau_p=None, s2t_tau_h=None,
                         high_ent_rho=None, high_ent_weight_ratio=2.0,
-                        top_k=30, T=1.0):
+                        top_k=None, T=1.0):
     """
     high_ent_rho        : top rho% token được coi là high-entropy (default 0.2)
     high_ent_weight_ratio: high-entropy token có weight cao hơn bao nhiêu lần (default 2.0)
@@ -492,68 +510,65 @@ def get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model
         teacher_outputs = teacher_model(**model_batch, use_cache=False)
         teacher_logits = teacher_outputs.logits
  
-    if args.model_parallel:
-        raise NotImplementedError
- 
     # ── NNM v3: apply token-level filters before KL ──
-    if getattr(args, 'use_nnm_filters', True):
-        # Extract active tokens
-        labels = no_model_batch["label"]
-        shift_s = logits[..., :-1, :]; shift_t = teacher_logits[..., :-1, :]
-        shift_labels = labels[..., 1:]
-        active = (shift_labels != -100)
-        vocab = min(shift_s.size(-1), shift_t.size(-1))
-        s_active = shift_s[active][..., :vocab]
-        t_active = shift_t[active][..., :vocab]
+    # if getattr(args, 'use_nnm_filters', True):
+    #     # Extract active tokens
+    #     labels = no_model_batch["label"]
+    #     shift_s = logits[..., :-1, :]; shift_t = teacher_logits[..., :-1, :]
+    #     shift_labels = labels[..., 1:]
+    #     active = (shift_labels != -100)
+    #     vocab = min(shift_s.size(-1), shift_t.size(-1))
+    #     s_active = shift_s[active][..., :vocab]
+    #     t_active = shift_t[active][..., :vocab]
  
-        T_cur = getattr(args, '_current_temperature', 1.0)
+    #     T_cur = getattr(args, '_current_temperature', 1.0)
  
-        s_filt, t_filt, weights = apply_token_filters(
-            s_active, t_active,
-            s2t_tau_p=NNM_CFG["s2t_tau_p"],
-            s2t_tau_h=NNM_CFG["s2t_tau_h"],
-            high_ent_rho=NNM_CFG["high_ent_rho"],
-            high_ent_weight_ratio=NNM_CFG["high_ent_weight_ratio"],
-            top_k=NNM_CFG["top_k_logits"],
-            T=T_cur,
-        )
-        # Use skewed forward KL on filtered tokens
-        fake_labels = torch.zeros(s_filt.shape[0], dtype=torch.long, device=s_filt.device)
-        mask = (fake_labels != -100).float()
+    #     s_filt, t_filt, weights = apply_token_filters(
+    #         s_active, t_active,
+    #         s2t_tau_p=NNM_CFG["s2t_tau_p"],
+    #         s2t_tau_h=NNM_CFG["s2t_tau_h"],
+    #         high_ent_rho=NNM_CFG["high_ent_rho"],
+    #         high_ent_weight_ratio=NNM_CFG["high_ent_weight_ratio"],
+    #         top_k=NNM_CFG["top_k_logits"],
+    #         T=T_cur,
+    #     )
+    #     # Use skewed forward KL on filtered tokens
+    #     fake_labels = torch.zeros(s_filt.shape[0], dtype=torch.long, device=s_filt.device)
+    #     mask = (fake_labels != -100).float()
  
-        if "sfkl" in args.type:
-            t_probs = F.softmax(t_filt, dim=-1); s_probs = F.softmax(s_filt, dim=-1)
-            mixed = args.skew_alpha * t_probs + (1 - args.skew_alpha) * s_probs
-            m_lp = torch.log(mixed.clamp(min=1e-10))
-            inf_mask = torch.isinf(s_filt) | torch.isinf(t_filt)
-            prod = torch.masked_fill(t_probs * m_lp, inf_mask, 0.).sum(-1)
-            if weights is not None:
-                distil_loss = -(prod * mask * weights).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
-            else:
-                distil_loss = -(prod * mask).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
+    #     if "sfkl" in args.type:
+    #         t_probs = F.softmax(t_filt, dim=-1); s_probs = F.softmax(s_filt, dim=-1)
+    #         mixed = args.skew_alpha * t_probs + (1 - args.skew_alpha) * s_probs
+    #         m_lp = torch.log(mixed.clamp(min=1e-10))
+    #         inf_mask = torch.isinf(s_filt) | torch.isinf(t_filt)
+    #         prod = torch.masked_fill(t_probs * m_lp, inf_mask, 0.).sum(-1)
+    #         if weights is not None:
+    #             distil_loss = -(prod * mask * weights).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
+    #         else:
+    #             distil_loss = -(prod * mask).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
 
-        elif "fkl" in args.type or args.type == "kd":
-            t_probs = F.softmax(t_filt, dim=-1); s_lp = F.log_softmax(s_filt, dim=-1)
-            inf_mask = torch.isinf(s_filt) | torch.isinf(t_filt)
-            prod = torch.masked_fill(t_probs * s_lp, inf_mask, 0.).sum(-1)
-            if weights is not None:
-                distil_loss = -(prod * mask * weights).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
-            else:
-                distil_loss = -(prod * mask).sum() / mask.sum().clamp(min=1) * (T_cur ** 2) 
+    #     elif "fkl" in args.type or args.type == "kd":
+    #         t_probs = F.softmax(t_filt, dim=-1); s_lp = F.log_softmax(s_filt, dim=-1)
+    #         inf_mask = torch.isinf(s_filt) | torch.isinf(t_filt)
+    #         prod = torch.masked_fill(t_probs * s_lp, inf_mask, 0.).sum(-1)
+    #         if weights is not None:
+    #             distil_loss = -(prod * mask * weights).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
+    #         else:
+    #             distil_loss = -(prod * mask).sum() / mask.sum().clamp(min=1) * (T_cur ** 2) 
 
-        elif "rkl" in args.type:
-            s_probs = F.softmax(s_filt, dim=-1)
-            s_lp = F.log_softmax(s_filt, dim=-1); t_lp = F.log_softmax(t_filt, dim=-1)
-            inf_mask = torch.isinf(s_filt) | torch.isinf(t_filt)
-            prod = torch.masked_fill(s_probs * (t_lp - s_lp), inf_mask, 0.).sum(-1)
-            if weights is not None:
-                distil_loss = -(prod * mask * weights).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
-            else:
-                distil_loss = -(prod * mask).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)        
-        else:
-            # Fallback: use original DistiLLM functions without filtering
-            distil_loss = _get_distil_loss_original(args, logits, teacher_logits, no_model_batch)
-        return distil_loss
+    #     elif "rkl" in args.type:
+    #         s_probs = F.softmax(s_filt, dim=-1)
+    #         s_lp = F.log_softmax(s_filt, dim=-1); t_lp = F.log_softmax(t_filt, dim=-1)
+    #         inf_mask = torch.isinf(s_filt) | torch.isinf(t_filt)
+    #         prod = torch.masked_fill(s_probs * (t_lp - s_lp), inf_mask, 0.).sum(-1)
+    #         if weights is not None:
+    #             distil_loss = -(prod * mask * weights).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
+    #         else:
+    #             distil_loss = -(prod * mask).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)        
+    #     else:
+    #         # Fallback: use original DistiLLM functions without filtering
+    #         distil_loss = _get_distil_loss_original(args, logits, teacher_logits, no_model_batch)
+    #     return distil_loss
  
     return _get_distil_loss_original(args, logits, teacher_logits, no_model_batch)
  
@@ -583,7 +598,7 @@ def get_teacher_lm_loss(args, tokenizer, model, teacher_model, model_batch):
         t_gen_out = teacher_model.generate(
             **model_batch, pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id, max_length=args.max_length,
-            top_k=args.top_k_logits, top_p=1, temperature=1.0, do_sample=True,
+            top_k=None, top_p=1, temperature=1.0, do_sample=True,
             return_dict_in_generate=True, output_scores=False)
     full_ids = t_gen_out.sequences
     input_ids = full_ids[:, :-1]
@@ -650,6 +665,7 @@ def finetune(args, tokenizer, model, optimizer, lr_scheduler,
         d_s = student_module.config.hidden_size
         L_t = teacher_module.config.num_hidden_layers
         L_s = student_module.config.num_hidden_layers
+        R = make_R(d_t, NNM_CFG["d_prime"], device, dtype)
  
         t_mid = select_mid_layers(L_t, NNM_CFG["n_mid_layers"])
         s_mid = select_mid_layers(L_s, NNM_CFG["n_mid_layers"])
@@ -808,16 +824,16 @@ def finetune(args, tokenizer, model, optimizer, lr_scheduler,
  
                     nnm_loss_val = nnm_loss_val + nnm_loss_one_layer(
                         h_s_active, h_t_active, projector,
-                        s_cents[s_lid].C, t_cents[s_lid].C,
+                        s_cents[s_lid].C, t_cents[s_lid].C, R,
                         lw_dict[s_lid], NNM_CFG["ns_iters"])
  
                 nnm_loss_val = nnm_loss_val / len(s_mid)
                 loss = loss + lam_nnm * nnm_loss_val
  
                 # Update student centroids
-                with torch.no_grad():
-                    for s_lid in s_mid:
-                        s_cents[s_lid].update(s_act[s_lid].detach())
+                # with torch.no_grad():
+                #     for s_lid in s_mid:
+                #         s_cents[s_lid].update(s_act[s_lid].detach())
  
             # ── Pre-trained data mixing (DistiLLM) ──
             if args.lm_data_dir is not None:
@@ -826,7 +842,9 @@ def finetune(args, tokenizer, model, optimizer, lr_scheduler,
  
             model.backward(loss)
             model.step()
- 
+            with torch.no_grad():
+                    for s_lid in s_mid:
+                        s_cents[s_lid].update(s_act[s_lid].detach())
             # ── Logging ──
             dist.all_reduce(loss, dist.ReduceOp.SUM, group=dp_group)
             global_loss = loss.item() / dp_world_size
@@ -923,7 +941,7 @@ def evaluate(args, tokenizer, model, dataset: LMTrainDataset, split, epoch, devi
     generation_config = GenerationConfig(
         do_sample=args.do_sample,
         top_p=args.top_p,
-        top_k=30,
+        top_k=None,
         temperature=args.temperature,
         repetition_penalty=args.repetition_penalty,
         max_length=args.max_length,
