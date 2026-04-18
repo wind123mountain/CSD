@@ -17,18 +17,18 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --master_port $MASTER_PORT"
 
 # model
-BASE_PATH=.
+BASE_PATH="/media/volume/tucnv/LLM_Distillation/CSD"
 CKPT_NAME="qwen2.5-0.5b"
 CKPT="Qwen/Qwen2.5-0.5B"
 TEACHER_CKPT_NAME="qwen2.5-1.5b-math"
-TEACHER_CKPT="Qwen/Qwen2.5-1.5B-Math"
+TEACHER_CKPT="Qwen/Qwen2.5-Math-1.5B"
 # data
 DATA_DIR="${BASE_PATH}/processed_data/MetaMathQA-50k/qwen/"
 # hp
-BATCH_SIZE=2
+BATCH_SIZE=8
 LR=0.0001
-GRAD_ACC=8
-EVAL_BATCH_SIZE=32
+GRAD_ACC=2
+EVAL_BATCH_SIZE=64
 EPOCHS=1
 # length
 MAX_LENGTH=512
@@ -70,8 +70,8 @@ OPTS+=" --max-prompt-length 256"
 OPTS+=" --do-train"
 OPTS+=" --do-valid"
 OPTS+=" --eval-gen"
-OPTS+=" --save-interval -1"
-OPTS+=" --eval-interval 300"
+OPTS+=" --save-interval 600"
+OPTS+=" --eval-interval 600"
 OPTS+=" --log-interval 20"
 OPTS+=" --mid-log-num -1"
 OPTS+=" --save ${SAVE_PATH}"

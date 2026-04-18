@@ -34,7 +34,7 @@ from utils import get_optimizer_params, get_optimizer_params_peft, print_args, i
 from utils import print_rank, get_rank
 from utils import save_rank
 from utils import all_gather
-from utils import load_parallel, save_parallel
+from utils import set_random_seed
 from utils import get_tokenizer, get_model
 
 from distillm import forward_kl, reverse_kl, js_distance, tv_distance
@@ -51,7 +51,7 @@ NNM_CFG = dict(
     # -- NNM core --
     lambda_nnm        = 0.10,       # NNM loss weight
     nnm_warmup        = 100,        # warmup steps for NNM weight
-    K_centroids       = 128,        # number of running centroids per layer
+    K_centroids       = 32,        # number of running centroids per layer
     d_prime           = 256,        # random projection dimension
     eta_centroid      = 0.05,       # centroid EMA rate
     T_dead            = 50,         # steps before dead centroid is revived
@@ -67,10 +67,10 @@ NNM_CFG = dict(
     # -- Token filtering (STAPO + Beyond 80/20) --
     s2t_tau_p         = None,       # spurious token prob threshold
     s2t_tau_h         = None,        # spurious token entropy threshold
-    high_ent_rho      = 0.2,        # keep top 20% entropy tokens for KL
- 
+    high_ent_rho      = None,        # keep top 20% entropy tokens for KL
+    high_ent_weight_ratio=2.0, #20% 
     # -- Top-K logit KD --
-    top_k_logits      = 20,
+    top_k_logits      = 30,
  
     # -- Difficulty-aware weighting --
     use_difficulty_weight  = False,
@@ -81,7 +81,7 @@ NNM_CFG = dict(
     kl_temp_min       = 1.0,
  
     # -- Centroid pre-pass --
-    centroid_prepass_batches = 3000,
+    centroid_prepass_batches = 500,
 )
 
 SEED = 42
@@ -127,16 +127,16 @@ def nuclear_norm_ns(M, n_iters=5):
 #  RUNNING CENTROIDS (from NNM-KD)
 # ============================================================================
 class RunningCentroids:
-    def __init__(self, K, d, eta, T_dead, device):
+    def __init__(self, K, d, eta, T_dead, device, dtype):
         self.K, self.d, self.eta, self.T_dead = K, d, eta, T_dead
         self.device = device
-        self.C    = torch.randn(K, d, device=device, dtype=torch.float32) * 0.01
+        self.C    = torch.randn(K, d, device=device, dtype=dtype) * 0.01
         self.dead = torch.zeros(K, device=device, dtype=torch.int32)
         self._step = 0
  
     @torch.no_grad()
     def update(self, H):
-        H = H.to(self.device).float()
+        H = H.to(self.device)
         if H.shape[0] == 0:
             return
         self._step += 1
@@ -155,30 +155,29 @@ class RunningCentroids:
                     self.dead[k] = 0
  
  
-# ============================================================================
-#  HIDDEN PROJECTOR — 2-layer MLP (from NNM-KD v3)
-# ============================================================================
-class HiddenProjector(nn.Module):
-    def __init__(self, d_teacher, d_student):
-        super().__init__()
-        d_mid = d_teacher // 2
-        self.net = nn.Sequential(
-            nn.Linear(d_teacher, d_mid, bias=False),
-            nn.GELU(),
-            nn.Linear(d_mid, d_student, bias=False),
-        )
-        nn.init.orthogonal_(self.net[2].weight)
+# # ============================================================================
+# #  HIDDEN PROJECTOR — 2-layer MLP (from NNM-KD v3)
+# # ============================================================================
+# class HiddenProjector(nn.Module):
+#     def __init__(self, d_teacher, d_student):
+#         super().__init__()
+#         d_mid = d_teacher // 2
+#         self.net = nn.Sequential(
+#             nn.Linear(d_teacher, d_mid, bias=False),
+#             nn.GELU(),
+#             nn.Linear(d_mid, d_student, bias=False),
+#         )
+#         nn.init.orthogonal_(self.net[2].weight)
  
-    def forward(self, x):
-        return self.net(x.float())
+#     def forward(self, x):
+#         return self.net(x.float())
  
  
 # ============================================================================
 #  NNM UTILITIES (from NNM-KD)
 # ============================================================================
-def make_R(d, d_prime, device):
-    torch.manual_seed(SEED)
-    return (torch.randn(d, d_prime, device=device) / math.sqrt(d_prime)).float()
+def make_R(d, d_prime, device, dtype):
+    return (torch.randn(d, d_prime, device=device, dtype=dtype) / math.sqrt(d_prime))
  
  
 def layer_weight(l, L, sigma=0.15):
@@ -194,22 +193,23 @@ def select_mid_layers(n_layers, n_mid):
     return sorted(set(int(i) for i in np.linspace(lo, hi, n_mid, dtype=int).tolist()))
  
  
-def nnm_loss_one_layer(H_s, H_t_proj, C_s, C_t, R, lw, ns_iters):
-    H_s = H_s.float(); H_t_proj = H_t_proj.float().detach()
-    C_s = C_s.float().detach(); C_t = C_t.float().detach(); R = R.float()
-    M_s = torch.cat([C_s, H_s], dim=0) @ R
-    M_t = torch.cat([C_t, H_t_proj], dim=0) @ R
-    m, n = M_s.shape; scale = math.sqrt(m * n)
+def nnm_loss_one_layer(H_s, H_t, projector, C_s, C_t, lw, ns_iters):
+    R_t = make_R(H_t.size(-1), NNM_CFG["d_prime"], H_t.device, H_t.dtype).detach()
+
+    M_s = projector(torch.cat([C_s.detach(), H_s], dim=0)) @ R_t
+    M_t = torch.cat([C_t.detach(), H_t], dim=0) @ R_t
+    scale = math.sqrt(M_t.size(0) * M_t.size(1))
     nn_s = nuclear_norm_ns(M_s, ns_iters) / scale
     nn_t = (nuclear_norm_ns(M_t, ns_iters) / scale).detach()
+
     return lw * (nn_s - nn_t) ** 2
  
  
 @torch.no_grad()
 def correct_teacher_hiddens(H_T, C_T, R, lam, ns_iters, tc_steps=1):
-    H = H_T.float().clone(); K = C_T.shape[0]; R = R.float()
+    H = H_T.clone(); K = C_T.shape[0]; R = R
     for _ in range(tc_steps):
-        M0 = torch.cat([C_T.float(), H], dim=0) @ R
+        M0 = torch.cat([C_T, H], dim=0) @ R
         P = newton_schulz_polar(M0, ns_iters)
         G_X = P[K:] @ R.T
         H = H + lam * G_X
@@ -229,7 +229,7 @@ def forward_with_hiddens(model, input_ids, attention_mask, layer_ids,
     logits = out.logits.to(target_device)
     hiddens_active, hiddens_full = {}, {}
     for lid in layer_ids:
-        h = out.hidden_states[lid].to(target_device).float()
+        h = out.hidden_states[lid].to(target_device)
         hiddens_full[lid] = h
         flat_h = h.reshape(-1, h.shape[-1])
         if label_mask is not None:
@@ -280,21 +280,22 @@ def compute_difficulty_weights(model, input_ids, attention_mask, early_layer_idx
 # ============================================================================
 def apply_token_filters(s_logits_active, t_logits_active,
                         s2t_tau_p=None, s2t_tau_h=None,
-                        high_ent_rho=None, top_k=None, T=1.0):
+                        high_ent_rho=None, high_ent_weight_ratio=2.0,
+                        top_k=30, T=1.0):
     """
-    Apply all v3 token-level filters to active logits:
-      1. S2T spurious mask (STAPO)
-      2. High-entropy selection (Beyond 80/20)
-      3. Top-K logit filtering
-      4. Temperature scaling
-    Returns filtered (s, t) ready for KL computation.
+    high_ent_rho        : top rho% token được coi là high-entropy (default 0.2)
+    high_ent_weight_ratio: high-entropy token có weight cao hơn bao nhiêu lần (default 2.0)
+                          => high:low = 2:1, tương đương 80/20 rule
+    Returns: (s, t, weights)  -- weights shape [N], dùng để nhân vào KL loss
     """
     s = s_logits_active.float()
     t = t_logits_active.float()
+    weights = None
+
     if s.shape[0] == 0:
-        return s, t
- 
-    # 1. S2T spurious token mask
+        return s, t, weights
+
+    # 1. S2T spurious token mask (giữ nguyên)
     if s2t_tau_p is not None and s2t_tau_h is not None:
         with torch.no_grad():
             s_probs = F.softmax(s, dim=-1)
@@ -306,18 +307,27 @@ def apply_token_filters(s_logits_active, t_logits_active,
         if valid.any() and valid.sum() < s.shape[0]:
             s = s[valid]
             t = t[valid]
- 
-    # 2. High-entropy selection
-    if high_ent_rho is not None and high_ent_rho < 1.0 and s.shape[0] > 4:
+
+    # 2. High-entropy WEIGHTING (thay vì filter bỏ)
+    if high_ent_rho is not None and s.shape[0] > 4:
         with torch.no_grad():
-            s_probs_ent = F.softmax(s, dim=-1)
-            s_ent = -(s_probs_ent * s_probs_ent.log().clamp(min=-100)).sum(-1)
-            k = max(1, int(high_ent_rho * s_ent.shape[0]))
-            _, topk_idx = s_ent.topk(k)
-        s = s[topk_idx]
-        t = t[topk_idx]
- 
-    # 3. Top-K logit filtering
+            t_probs_ent = F.softmax(t, dim=-1)
+            t_ent = -(t_probs_ent * t_probs_ent.log().clamp(min=-100)).sum(-1)
+
+            N = t_ent.shape[0]
+            k = max(1, int(high_ent_rho * N))  # số token high-entropy
+
+            # Tạo weight vector: mặc định = 1.0
+            weights = torch.ones(N, device=s.device, dtype=s.dtype)
+
+            # Top-k entropy index nhận weight cao hơn
+            _, topk_idx = t_ent.topk(k)
+            weights[topk_idx] = high_ent_weight_ratio
+
+            # Normalize để tổng weight = N (giữ scale loss ổn định)
+            weights = weights / weights.mean()
+
+    # 3. Top-K logit filtering (giữ nguyên)
     vocab = s.shape[-1]
     if top_k is not None and top_k < vocab:
         with torch.no_grad():
@@ -327,31 +337,32 @@ def apply_token_filters(s_logits_active, t_logits_active,
     else:
         s = s / T
         t = t / T
- 
-    return s, t
+
+    return s, t, weights
  
  
 # ============================================================================
 #  CENTROID PRE-PASS (from NNM-KD)
 # ============================================================================
 @torch.no_grad()
-def build_teacher_centroids(teacher, projector, dataloader,
+def build_teacher_centroids(teacher, dataloader, dtype,
                             t_mid, s_mid, device_t, device_s,
-                            K, d_s, eta, T_dead, max_batches=3000):
-    centroids = {s_lid: RunningCentroids(K, d_s, eta, T_dead, device_s)
+                            K, d_t, eta, T_dead, max_batches=1500):
+    centroids = {s_lid: RunningCentroids(K, d_t, eta, T_dead, device_s, dtype=dtype)
                  for s_lid in s_mid}
-    teacher.eval(); projector.eval()
+    teacher.eval()
     for i, (model_batch, no_model_batch, gen_data, _, _) in enumerate(
             tqdm(dataloader, desc="  Teacher centroid pre-pass", total=max_batches)):
         if i >= max_batches:
             break
         ids = model_batch["input_ids"].to(device_t)
         mask = model_batch["attention_mask"].to(device_t)
-        t_act, _, _ = forward_with_hiddens(teacher, ids, mask, t_mid, device_t, no_grad=True)
+        label_mask = (no_model_batch["label"] != -100)
+        t_act, _, _ = forward_with_hiddens(teacher, ids, mask, t_mid, device_t, no_grad=True, label_mask=label_mask)
         for t_lid, s_lid in zip(t_mid, s_mid):
-            h_proj = projector(t_act[t_lid].to(device_s)).float()
+            h_proj = t_act[t_lid].to(device_s)
             centroids[s_lid].update(h_proj)
-    projector.train()
+
     return centroids
  
  
@@ -385,52 +396,72 @@ def get_teacher_model(args, device):
     model.eval()
     return model
  
- 
+
 def get_optimizer(args, model):
+    """Set up the optimizer."""
+    # Build parameter groups (weight decay and non-decay).
     while isinstance(model, DDP):
         model = model.module
+
     if args.peft is not None:
         param_groups = get_optimizer_params_peft(args, model)
     else:
         param_groups = get_optimizer_params(args, model)
+
+    if model.projectors is not None:
+        param_groups.append({
+            "params": model.projectors.parameters(),
+            "lr": 5e-4
+        })
+
+    # Use AdamW.
     optimizer = AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
     print_rank(f'Optimizer = {optimizer.__class__.__name__}')
     return optimizer
- 
- 
+
+
 def get_learning_rate_scheduler(args, optimizer):
     if args.total_iters is None:
         args.total_iters = args.train_iters_per_epoch * args.epochs
     if args.lr_decay_style == "constant":
-        lr_scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_iters)
+        lr_scheduler = get_constant_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=args.warmup_iters)
     elif args.lr_decay_style == "cosine":
-        lr_scheduler = CosineAnnealingLR(optimizer, T_max=args.total_iters, eta_min=args.lr_min)
+        lr_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=args.total_iters,
+            eta_min=args.lr_min)
     elif args.lr_decay_style == "noam":
         lr_scheduler = get_polynomial_decay_schedule_with_warmup(
-            optimizer, num_warmup_steps=args.warmup_iters,
-            num_training_steps=args.total_iters, power=0.5)
-    elif args.lr_decay_style == "wrmup_cosine":
-        lr_scheduler = get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps=args.warmup_ratio * args.total_iters,
-            num_training_steps=args.total_iters)
+            optimizer,
+            num_warmup_steps=args.warmup_iters,
+            num_training_steps=args.total_iters,
+            power=0.5)
     else:
         raise ValueError(f"lr_scheduler of type {args.lr_decay_style} is not supported yet.")
+
     return lr_scheduler
- 
- 
-def setup_model_and_optimizer(args, ds_config, device, set_optim=True):
-    model = get_model(args, device)
-    if set_optim:
-        optimizer = get_optimizer(args, model)
-        lr_scheduler = get_learning_rate_scheduler(args, optimizer)
-    else:
-        optimizer, lr_scheduler = None, None
+
+
+def setup_model_and_optimizer(args, model, ds_config, set_optim=True):
+    # get the optimizer and lr_scheduler
+    optimizer = get_optimizer(args, model)
+    lr_scheduler = get_learning_rate_scheduler(args, optimizer)
+        
     model, optimizer, _, lr_scheduler = deepspeed.initialize(
-        model=model, optimizer=optimizer, args=args,
-        lr_scheduler=lr_scheduler, mpu=None, config_params=ds_config)
+        model=model,
+        optimizer=optimizer,
+        args=args,
+        lr_scheduler=lr_scheduler,
+        mpu=None,
+        config_params=ds_config
+    )
+    
+    # get the memory usage
     print_rank("Model mem\n", torch.cuda.memory_summary())
     return model, optimizer, lr_scheduler
- 
+
  
 def prepare_dataset(args, tokenizer):
     data = {}
@@ -465,7 +496,7 @@ def get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model
         raise NotImplementedError
  
     # ── NNM v3: apply token-level filters before KL ──
-    if getattr(args, 'use_nnm_filters', False):
+    if getattr(args, 'use_nnm_filters', True):
         # Extract active tokens
         labels = no_model_batch["label"]
         shift_s = logits[..., :-1, :]; shift_t = teacher_logits[..., :-1, :]
@@ -477,11 +508,12 @@ def get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model
  
         T_cur = getattr(args, '_current_temperature', 1.0)
  
-        s_filt, t_filt = apply_token_filters(
+        s_filt, t_filt, weights = apply_token_filters(
             s_active, t_active,
             s2t_tau_p=NNM_CFG["s2t_tau_p"],
             s2t_tau_h=NNM_CFG["s2t_tau_h"],
             high_ent_rho=NNM_CFG["high_ent_rho"],
+            high_ent_weight_ratio=NNM_CFG["high_ent_weight_ratio"],
             top_k=NNM_CFG["top_k_logits"],
             T=T_cur,
         )
@@ -495,18 +527,29 @@ def get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model
             m_lp = torch.log(mixed.clamp(min=1e-10))
             inf_mask = torch.isinf(s_filt) | torch.isinf(t_filt)
             prod = torch.masked_fill(t_probs * m_lp, inf_mask, 0.).sum(-1)
-            distil_loss = -(prod * mask).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
+            if weights is not None:
+                distil_loss = -(prod * mask * weights).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
+            else:
+                distil_loss = -(prod * mask).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
+
         elif "fkl" in args.type or args.type == "kd":
             t_probs = F.softmax(t_filt, dim=-1); s_lp = F.log_softmax(s_filt, dim=-1)
             inf_mask = torch.isinf(s_filt) | torch.isinf(t_filt)
             prod = torch.masked_fill(t_probs * s_lp, inf_mask, 0.).sum(-1)
-            distil_loss = -(prod * mask).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
+            if weights is not None:
+                distil_loss = -(prod * mask * weights).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
+            else:
+                distil_loss = -(prod * mask).sum() / mask.sum().clamp(min=1) * (T_cur ** 2) 
+
         elif "rkl" in args.type:
             s_probs = F.softmax(s_filt, dim=-1)
             s_lp = F.log_softmax(s_filt, dim=-1); t_lp = F.log_softmax(t_filt, dim=-1)
             inf_mask = torch.isinf(s_filt) | torch.isinf(t_filt)
             prod = torch.masked_fill(s_probs * (t_lp - s_lp), inf_mask, 0.).sum(-1)
-            distil_loss = -(prod * mask).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
+            if weights is not None:
+                distil_loss = -(prod * mask * weights).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)
+            else:
+                distil_loss = -(prod * mask).sum() / mask.sum().clamp(min=1) * (T_cur ** 2)        
         else:
             # Fallback: use original DistiLLM functions without filtering
             distil_loss = _get_distil_loss_original(args, logits, teacher_logits, no_model_batch)
@@ -540,7 +583,7 @@ def get_teacher_lm_loss(args, tokenizer, model, teacher_model, model_batch):
         t_gen_out = teacher_model.generate(
             **model_batch, pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id, max_length=args.max_length,
-            top_k=0, top_p=1, temperature=1.0, do_sample=True,
+            top_k=args.top_k_logits, top_p=1, temperature=1.0, do_sample=True,
             return_dict_in_generate=True, output_scores=False)
     full_ids = t_gen_out.sequences
     input_ids = full_ids[:, :-1]
@@ -562,7 +605,7 @@ def get_teacher_lm_loss(args, tokenizer, model, teacher_model, model_batch):
 #  MAIN TRAINING LOOP — DistiLLM + NNM-KD features
 # ============================================================================
 def finetune(args, tokenizer, model, optimizer, lr_scheduler,
-             dataset, device, teacher_model=None):
+             dataset, device, dtype, teacher_model=None):
     print_rank("Start Fine-tuning (DistiLLM + NNM-KD v3)")
  
     if args.model_parallel:
@@ -590,7 +633,7 @@ def finetune(args, tokenizer, model, optimizer, lr_scheduler,
     student_generator = SampleGenerator(args, tokenizer)
  
     # ── NNM SETUP ────────────────────────────────────────────────
-    use_nnm = getattr(args, 'use_nnm', False) and teacher_model is not None
+    use_nnm = getattr(args, 'use_nnm', True) and teacher_model is not None
     projector = None
     R = None
     t_cents, s_cents = {}, {}
@@ -615,27 +658,20 @@ def finetune(args, tokenizer, model, optimizer, lr_scheduler,
         print_rank(f"  Teacher hidden={d_t}, layers={L_t}, mid={t_mid}")
         print_rank(f"  Student hidden={d_s}, layers={L_s}, mid={s_mid}")
  
-        projector = HiddenProjector(d_t, d_s).to(device)
-        R = make_R(d_s, NNM_CFG["d_prime"], device)
- 
         # Centroid pre-pass
         print_rank("  Building teacher centroids...")
         t_cents = build_teacher_centroids(
-            teacher_model, projector, train_dataloader,
+            teacher_model, train_dataloader, dtype,
             t_mid, s_mid, device, device,
-            NNM_CFG["K_centroids"], d_s,
+            NNM_CFG["K_centroids"], d_t,
             NNM_CFG["eta_centroid"], NNM_CFG["T_dead"],
             max_batches=NNM_CFG["centroid_prepass_batches"],
         )
         s_cents = {
             s_lid: RunningCentroids(NNM_CFG["K_centroids"], d_s,
-                                     NNM_CFG["eta_centroid"], NNM_CFG["T_dead"], device)
+                                     NNM_CFG["eta_centroid"], NNM_CFG["T_dead"], device, dtype)
             for s_lid in s_mid
         }
- 
-        # Add projector params to optimizer
-        for pg in optimizer.param_groups:
-            pg['params'].extend(list(projector.parameters()))
  
     # Enable NNM filters in distil loss
     args.use_nnm_filters = getattr(args, 'use_nnm_filters', use_nnm)
@@ -645,6 +681,8 @@ def finetune(args, tokenizer, model, optimizer, lr_scheduler,
  
     adaptive_threshold = args.init_threshold if "adaptive" in args.type else -1.0
     prev_avg_loss = evaluate(args, tokenizer, model, dataset["dev"], "dev", 0, device, adaptive_threshold)
+    torch.cuda.empty_cache()
+    # prev_avg_loss = 0
     replay_buffer = ReplayBuffer(args)
  
     def nnm_weight_fn(s):
@@ -729,8 +767,7 @@ def finetune(args, tokenizer, model, optimizer, lr_scheduler,
             nnm_loss_val = torch.tensor(0., device=device)
             if use_nnm:
                 student_module = model.module if hasattr(model, 'module') else model
-                labels = no_model_batch["label"]
-                label_mask = (labels != -100)
+                label_mask = (no_model_batch["label"] != -100)
  
                 # Student forward with hiddens
                 s_act, s_full, _ = forward_with_hiddens(
@@ -742,37 +779,37 @@ def finetune(args, tokenizer, model, optimizer, lr_scheduler,
                 t_act, t_full, _ = forward_with_hiddens(
                     teacher_model, model_batch["input_ids"],
                     model_batch["attention_mask"],
-                    t_mid, device, no_grad=True)
+                    t_mid, device, no_grad=True, label_mask=label_mask)
  
                 # Project + correct teacher hiddens
                 lam_nnm = nnm_weight_fn(global_step)
-                label_mask_float = label_mask.float()
  
-                for t_lid, s_lid in zip(t_mid, s_mid):
+                for t_lid, s_lid, projector in zip(t_mid, s_mid, model.projectors):
                     h_t = t_full[t_lid].to(device)
                     B, T_len, _ = h_t.shape
-                    h_proj = projector(h_t.reshape(-1, d_t)).detach()
+
+                    # h_proj = projector(h_t.reshape(-1, d_t)).detach()
+                    # if NNM_CFG["do_teacher_correction"]:
+                    #     flat_mask = model_batch["attention_mask"].reshape(-1).bool()
+                    #     h_active = h_proj[flat_mask]
+                    #     h_corr = correct_teacher_hiddens(
+                    #         h_active, t_cents[s_lid].C, R,
+                    #         NNM_CFG["tc_lambda"], NNM_CFG["ns_iters"], NNM_CFG["tc_steps"])
+                    #     h_corr_full = h_proj.clone()
+                    #     h_corr_full[flat_mask] = h_corr.to(h_proj.dtype)
+                    #     h_t_proj = h_corr_full.reshape(B, T_len, d_s)
+                    # else:
+                    #     h_t_proj = h_proj.reshape(B, T_len, d_s)
  
-                    if NNM_CFG["do_teacher_correction"]:
-                        flat_mask = model_batch["attention_mask"].reshape(-1).bool()
-                        h_active = h_proj[flat_mask]
-                        h_corr = correct_teacher_hiddens(
-                            h_active, t_cents[s_lid].C, R,
-                            NNM_CFG["tc_lambda"], NNM_CFG["ns_iters"], NNM_CFG["tc_steps"])
-                        h_corr_full = h_proj.clone()
-                        h_corr_full[flat_mask] = h_corr.to(h_proj.dtype)
-                        h_t_proj = h_corr_full.reshape(B, T_len, d_s)
-                    else:
-                        h_t_proj = h_proj.reshape(B, T_len, d_s)
- 
-                    label_flat = label_mask_float.reshape(-1).bool()
-                    h_t_active = h_t_proj.reshape(-1, d_s)[label_flat]
-                    h_s_active = s_act[s_lid]
+                    h_t_active = t_act[t_lid].reshape(-1, d_t)
+                    h_s_active = s_act[s_lid].reshape(-1, d_s) # (B*N, ds)
+
+                    # print("h_t_active.shape, h_s_active.shape: ", h_t_active.shape, h_s_active.shape)
  
                     nnm_loss_val = nnm_loss_val + nnm_loss_one_layer(
-                        h_s_active, h_t_active,
+                        h_s_active, h_t_active, projector,
                         s_cents[s_lid].C, t_cents[s_lid].C,
-                        R, lw_dict[s_lid], NNM_CFG["ns_iters"])
+                        lw_dict[s_lid], NNM_CFG["ns_iters"])
  
                 nnm_loss_val = nnm_loss_val / len(s_mid)
                 loss = loss + lam_nnm * nnm_loss_val
@@ -780,7 +817,7 @@ def finetune(args, tokenizer, model, optimizer, lr_scheduler,
                 # Update student centroids
                 with torch.no_grad():
                     for s_lid in s_mid:
-                        s_cents[s_lid].update(s_act[s_lid].float().detach())
+                        s_cents[s_lid].update(s_act[s_lid].detach())
  
             # ── Pre-trained data mixing (DistiLLM) ──
             if args.lm_data_dir is not None:
@@ -852,9 +889,10 @@ def finetune(args, tokenizer, model, optimizer, lr_scheduler,
             if args.eval_interval and global_step % args.eval_interval == 0 and step % args.gradient_accumulation_steps == 0:
                 curr_avg_loss = evaluate(args, tokenizer, model, dataset["dev"], "dev",
                                           epoch, device, adaptive_threshold)
+                torch.cuda.empty_cache()
                 if "adaptive" in args.type:
                     if curr_avg_loss >= prev_avg_loss + args.loss_eps:
-                        adaptive_threshold += 0.1
+                        adaptive_threshold += 0.05
                         adaptive_threshold = min(adaptive_threshold, 1.0)
                         prev_avg_loss = curr_avg_loss
                 model.train()
@@ -885,7 +923,7 @@ def evaluate(args, tokenizer, model, dataset: LMTrainDataset, split, epoch, devi
     generation_config = GenerationConfig(
         do_sample=args.do_sample,
         top_p=args.top_p,
-        top_k=args.top_k,
+        top_k=30,
         temperature=args.temperature,
         repetition_penalty=args.repetition_penalty,
         max_length=args.max_length,
@@ -917,6 +955,8 @@ def evaluate(args, tokenizer, model, dataset: LMTrainDataset, split, epoch, devi
                 loss = loss_func(logits.view(-1, logits.shape[-1]), no_model_batch["label"].view(-1))
             
             max_new_tokens = args.max_length - gen_data["input_ids"].size(1)
+
+            # print("input: ", tokenizer.decode(model_batch['input_ids'][0]))
             
             if args.eval_gen:            
                 gen_out = model.generate(
@@ -1004,6 +1044,10 @@ def main():
     args.fp32 = not ds_config["fp16"]["enabled"]  
     args.bf16 = "bf16" in ds_config and ds_config["bf16"]["enabled"]  
     args.deepspeed_config = None
+
+    dtype = torch.float32 if args.fp32 else torch.float16
+    if args.bf16:
+        dtype = torch.bfloat16
     
     # get the tokenizer
     tokenizer = get_tokenizer(args)
@@ -1031,19 +1075,34 @@ def main():
         if args.eval_interval == -1:
             args.eval_interval = args.train_iters_per_epoch
     
-    model, optimizer, lr_scheduler = setup_model_and_optimizer(args, ds_config, device, set_optim=args.do_train)
-    
+    model = get_model(args, device)
+       
     if args.teacher_model_type is None:
         args.teacher_model_type = args.model_type
     
     if args.teacher_model_path is not None:
         teacher_model = get_teacher_model(args, device)
-        teacher_model.resize_token_embeddings(model.module.config.vocab_size)
+        teacher_model.resize_token_embeddings(model.config.vocab_size)
     else:
         teacher_model = None
+
+    if teacher_model is not None:
+        teacher_hidden_size = teacher_model.config.hidden_size
+        student_hidden_size = model.config.hidden_size
+
+        projector_list = nn.ModuleList()
+        for _ in range(NNM_CFG["n_mid_layers"]):
+            projector = nn.Linear(student_hidden_size, teacher_hidden_size, dtype=dtype)
+            projector = projector.to(device)
+            projector_list.append(projector)
+    else:
+        projector_list = None
+    model.projectors = projector_list
+   
+    model, optimizer, lr_scheduler = setup_model_and_optimizer(args, model, ds_config, set_optim=args.do_train) 
     
     if args.do_train:
-        model = finetune(args, tokenizer, model, optimizer, lr_scheduler, dataset, device, teacher_model=teacher_model)
+        model = finetune(args, tokenizer, model, optimizer, lr_scheduler, dataset, device, dtype, teacher_model=teacher_model)
    
     if args.do_eval:
         evaluate(args, tokenizer, model, dataset["test"], "test", 0, device)

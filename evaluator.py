@@ -2,13 +2,15 @@ import torch
 import os
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed, GenerationConfig
-from ed_eval import ed_evaluate
+# from ed_eval import ed_evaluate
 from rouge_metric import compute_metrics
 from peft import PeftModel
 from datasets import load_dataset
 from typing import Dict, List, Tuple, Any
 from tqdm.auto import tqdm
 import json
+from transformers import set_seed
+import re
 from data_utils.lm_datasets import LMEvalDataset
 import torch.nn.functional as F
 import random
@@ -108,8 +110,8 @@ class Evaluator:
         
         results = compute_metrics(responses, references)
 
-        ed_metrics = ed_evaluate(responses, references)
-        results.update(ed_metrics)
+        # ed_metrics = ed_evaluate(responses, references)
+        # results.update(ed_metrics)
 
         return results, responses
 
@@ -208,6 +210,133 @@ class Evaluator:
                 }
         
         return results
+    
+    def evaluate_gsm8k(
+        self,
+        batch_size: int = 64,
+        max_new_tokens: int = 512,
+        system_prompt: str = "Put your final answer within \\boxed{}.",
+        seed: int = 42,
+    ) -> dict:
+        set_seed(seed)
+        dataset = load_dataset("gsm8k", "main", split="test")
+        total = len(dataset)
+        correct = 0
+        gt_list, pred_list = [], []
+
+        progress = tqdm(range(0, total, batch_size), desc="GSM8K", unit="batch")
+
+        for i in progress:
+            batch = dataset[i:i + batch_size]
+            prompts, gt_answers = [], []
+
+            for question, answer in zip(batch['question'], batch['answer']):
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": question},
+                ]
+                prompt = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True)
+                prompts.append(prompt)
+                gt_answers.append(extract_gsm8k_answer(answer))
+
+            gt_list.extend(gt_answers)
+
+            inputs = self.tokenizer(
+                prompts, return_tensors="pt",
+                padding=True, truncation=True,
+            ).to(self.device)
+
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
+            decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+            for pred, gt in zip(decoded, gt_answers):
+                pred_ans = extract_math_answer(pred)
+                if pred_ans is not None and gt is not None and pred_ans == gt:
+                    correct += 1
+                pred_list.append(pred_ans)
+
+            # ── DEBUG: chỉ print batch đầu tiên ──
+            if i == 0:
+                print("\n" + "="*60)
+                print(f"PROMPT MẪU:\n{repr(prompts[0][-300:])}")
+                print(f"\nOUTPUT MẪU (raw):\n{decoded[0][-400:]}")
+                print(f"\nGT answer: {gt_answers[0]}")
+                print(f"Extracted pred: {pred_list[0]}")
+                print("="*60 + "\n")
+                
+            if i % (batch_size * 5) == 0:
+                print(f"[{i}/{total}] Acc so far: {correct / (i + len(batch['question'])):.4f}")
+
+        pass_at_1 = correct / total
+        print(f"\nPASS@1 on GSM8K: {pass_at_1:.4%}")
+        return {"pass@1": round(pass_at_1 * 100, 4), "correct": correct,
+                "total": total, "predictions": pred_list, "references": gt_list}
+
+    @torch.no_grad()
+    def evaluate_math500(
+        self,
+        batch_size: int = 32,
+        max_new_tokens: int = 512,
+        system_prompt: str = "Put your final answer within \\boxed{}.",
+        seed: int = 42,
+    ) -> dict:
+        set_seed(seed)
+        dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
+        total = len(dataset)
+        correct = 0
+        pred_list, gt_list = [], []
+
+        progress = tqdm(range(0, total, batch_size), desc="MATH-500", unit="batch")
+
+        for i in progress:
+            batch = dataset[i:i + batch_size]
+            prompts, gt_answers = [], []
+
+            for question, answer in zip(batch['problem'], batch['solution']):
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": question},
+                ]
+                prompt = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True)
+                prompts.append(prompt)
+                gt_answers.append(extract_math_answer(answer))
+
+            inputs = self.tokenizer(
+                prompts, return_tensors="pt",
+                padding=True, truncation=True,
+            ).to(self.device)
+
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
+            decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+            for pred, gt in zip(decoded, gt_answers):
+                pred_ans = extract_math_answer(pred)
+                if pred_ans is not None and gt is not None and pred_ans == gt:
+                    correct += 1
+                pred_list.append(pred_ans)
+                gt_list.append(gt)
+
+            if i % (batch_size * 10) == 0:
+                print(f"[{i}/{total}] Acc so far: {correct / (i + len(batch['problem'])):.4f}")
+
+        pass_at_1 = correct / total
+        print(f"\nPASS@1 (MATH-500): {pass_at_1:.4%}")
+        return {"pass@1": round(pass_at_1 * 100, 4), "correct": correct,
+                "total": total, "predictions": pred_list, "references": gt_list}
 
     @torch.no_grad()
     def generate_and_save_outputs(
@@ -266,7 +395,6 @@ class Evaluator:
             decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
             
             for p, gen in zip(prompts, decoded):
-                # cắt prompt ra để chỉ giữ phần model sinh
                 if gen.startswith(p):
                     gen = gen[len(p):].strip()
                 generations.append({"prompt": p, "generated_text": gen})
@@ -277,3 +405,17 @@ class Evaluator:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
     
         print(f"Saved {len(generations)} generations to {output_file}")
+
+def extract_gsm8k_answer(text: str) -> str:
+    return text.split('####')[-1].strip()
+
+
+def extract_math_answer(text: str):
+    m = re.findall(r'\\boxed\{([^}]*)\}', text)
+    if m:
+        return m[-1].strip()
+    nums = re.findall(r'-?\d+\.?\d*', text.replace(',', ''))
+    return nums[-1] if nums else None
+
+
+

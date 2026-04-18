@@ -45,7 +45,7 @@ class Encoder(object):
 
     def encode(self, sample):
         arr_str = sample["response"].split("The answer is:")
-        arr_str[-1] = " \\boxed{"+ arr_str[-1].strip() +"}"
+        arr_str[-1] = " \\boxed{"+ arr_str[-1].strip() + "}"
         reasoning = "The answer is:".join(arr_str[:-1])
         answer = "The answer is: " + arr_str[-1]
         response = reasoning + answer
@@ -59,7 +59,7 @@ class Encoder(object):
         if re.search(r'<think>', prompt):
             prompt = prompt + '</think>'
             
-        full = prompt + '\n' +  response
+        full = prompt + '\n' +  response + self.tokenizer.eos_token
         
         prompt_tokens = Encoder.tokenizer.encode(prompt, add_special_tokens=False)
         full_tokens = Encoder.tokenizer.encode(full, add_special_tokens=False)
