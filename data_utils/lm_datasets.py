@@ -33,10 +33,6 @@ class LMTrainDataset(Dataset):
                 self.raw = [json.loads(line) for line in f.readlines()]
                 self.answers = [x["response"] if isinstance(x["response"], list) else [x["response"]] for x in self.raw]
                 self.full_texts = [x["prompt"] + x["response"] for x in self.raw]
-                self.offset_mapping = [tokenizer(text, return_offsets_mapping=True, truncation=True, 
-                                                 max_length=self.max_length, padding="max_length",
-                                                 add_special_tokens=False, return_tensors="pt")["offset_mapping"]
-                                       for text in self.full_texts]
         
         print_rank(len(self.lm_ctx))
         if num == -1:
